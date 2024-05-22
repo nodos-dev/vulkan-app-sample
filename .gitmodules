@@ -1,0 +1,3 @@
+[submodule "External/nosVulkan"]
+	path = External/nosVulkan
+	url = https://github.com/mediaz/nosVulkan.git
