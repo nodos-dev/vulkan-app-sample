@@ -1,3 +1,6 @@
 [submodule "External/nosVulkan"]
 	path = External/nosVulkan
 	url = https://github.com/mediaz/nosVulkan.git
+[submodule "External/glfw"]
+	path = External/glfw
+	url = https://github.com/glfw/glfw.git
