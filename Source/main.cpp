@@ -149,7 +149,7 @@ bool CreateSwapchain()
 	sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
 	sci.surface = surface;
 	sci.minImageCount = 3;
-	sci.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+	sci.imageFormat = VK_FORMAT_R8G8B8A8_UNORM;
 	sci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
 	sci.imageExtent = {.width = WIDTH, .height = HEIGHT};
 	sci.imageArrayLayers = 1;
@@ -298,9 +298,10 @@ void CreateTexturePinsInNodos()
 		Ext.mutate_handle((u64)ShaderInput->GetExportInfo().Handle);
 		Ext.mutate_allocation_size((u64)ShaderInput->GetExportInfo().AllocationSize);
 		Ext.mutate_pid((u64)ShaderInput->GetExportInfo().PID);
-		Texture.unmanaged = true;
+		Texture.unmanaged = false;
 		Texture.unscaled = true;
 		Texture.handle = 0;
+		Texture.offset = ShaderInput->GetExportInfo().Offset;
 
 		flatbuffers::FlatBufferBuilder fb;
 		auto offset1 = nos::sys::vulkan::CreateTexture(fb, &Texture);
@@ -333,9 +334,10 @@ void CreateTexturePinsInNodos()
 		Ext.mutate_handle((u64)ShaderOutput->GetExportInfo().Handle);
 		Ext.mutate_allocation_size((u64)ShaderOutput->GetExportInfo().AllocationSize);
 		Ext.mutate_pid((u64)ShaderOutput->GetExportInfo().PID);
-		Texture.unmanaged = true;
+		Texture.unmanaged = false;
 		Texture.unscaled = true;
 		Texture.handle = 0;
+		Texture.offset = ShaderOutput->GetExportInfo().Offset;
 
 		flatbuffers::FlatBufferBuilder fb;
 		auto offset1 = nos::sys::vulkan::CreateTexture(fb, &Texture);
@@ -386,7 +388,6 @@ int main()
 				  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
 				  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 		.ExternalMemoryHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
-		.Imported = 0,
 	};
 
 	VkResult re;

@@ -7,5 +7,5 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
     vec4 color = texture(Input, uv);
-    outColor = vec4(uv.x, uv.y, 0.0f, 1.0f);
+    outColor = vec4(color.x, color.y, uv.x, 1.0f);
 }
