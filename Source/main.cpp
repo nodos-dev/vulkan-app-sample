@@ -315,7 +315,7 @@ void CreateTexturePinsInNodos()
 
 		std::vector<flatbuffers::Offset<nos::fb::Pin>> pins;
 		flatbuffers::FlatBufferBuilder fbb;
-		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Input", "nos.sys.vulkan.Texture", nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, false, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Hello there!", "WHAT IS THAT!??"));
+		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Input", "nos.sys.vulkan.Texture", nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, false, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
 		auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::NONE, 0, &pins, 0, 0, 0, 0);
 		fbb.Finish(offset);
 		auto buf = fbb.Release();
@@ -350,14 +350,13 @@ void CreateTexturePinsInNodos()
 
 		std::vector<flatbuffers::Offset<nos::fb::Pin>> pins;
 		flatbuffers::FlatBufferBuilder fbb;
-		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Output", "nos.sys.vulkan.Texture", nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, false, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Hello there!", "WHAT IS THAT OUTPUTTT!??"));
+		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Output", "nos.sys.vulkan.Texture", nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, false, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
 		auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::NONE, 0, &pins, 0, 0, 0, 0);
 		fbb.Finish(offset);
 		auto buf = fbb.Release();
 		auto root = flatbuffers::GetRoot<nos::PartialNodeUpdate>(buf.data());
 		client->SendPartialNodeUpdate(*root);
 	}
-
 
 }
 
@@ -417,18 +416,6 @@ int main()
 		RP->BindResource("Input", ShaderInput, VkFilter::VK_FILTER_NEAREST);
 		RP->TransitionInput(cmd, "Input", ShaderInput);
 
-		//vk::Buffer
-		//VertexData verts;
-		//verts = VertexData{
-		//	.Buffer = FindBuffer(v.Buffer),
-		//	.VertexOffset = v.VertexOffset,
-		//	.IndexOffset = v.IndexOffset,
-		//	.NumIndices = v.IndexCount,
-		//	.DepthWrite = (bool)v.DepthWrite,
-		//	.DepthTest = (bool)v.DepthTest,
-		//	.DepthFunc = (VkCompareOp)v.DepthFunc,
-		//};
-
 		Renderpass::ExecPassInfo info{
 		  .BeginInfo = {.OutImage = ShaderOutput,
 		  			  .DepthAttachment = std::nullopt,
@@ -437,19 +424,9 @@ int main()
 		  			  .FrameNumber = 0,
 		  			  .DeltaSeconds = 0.f,
 		  			  .ClearCol = {0.0f,0.0f,0.0f,1.0f}},
-		  	//.VtxData = ConvertVertices(params->Vertices, &verts)};
-						  .VtxData = 0};
+					  .VtxData = 0};
 
 		RP->Exec(cmd, info);
-
-		//auto texture = renderTarget->Download(cmd);
-
-		//cmd->Submit();
-		//cmd->Wait();
-
-		//u8* textureRaw = texture->Map();
-		//stbi_write_png("output.png", 800, 600, 4, textureRaw, 800 * 4);
-
 		
 		//copy from texture to swapchain image
 		swapchainInfo.Images[imageIndex]->CopyFrom(cmd, ShaderOutput);
@@ -478,8 +455,6 @@ int main()
 
 		frame = (frame + 1) % swapchainInfo.FrameCount;
     }
-
-
 
 	vkDestroySurfaceKHR(context->Instance, surface, nullptr);
 	glfwDestroyWindow(window);
