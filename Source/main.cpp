@@ -1,3 +1,7 @@
+/*
+ * Copyright MediaZ Teknoloji A.S. All Rights Reserved.
+ */
+
 #define NOMINMAX 1
 
 
