@@ -81,7 +81,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 	void OnPinValueChanged(nos::fb::UUID const& pinId, uint8_t const* data, size_t size, bool reset, uint64_t frameNumber) override {}
 	void OnPinShowAsChanged(nos::fb::UUID const& pinId, nos::fb::ShowAs newShowAs) override {}
 	void OnExecuteAppInfo(nos::app::AppExecuteInfo const* appExecuteInfo) override {}
-	void OnFunctionCall(nos::fb::UUID const& nodeId, nos::fb::Node const& function) override {}
+	void OnFunctionCall(nos::app::FunctionCall const* functionCall) override {}
 	void OnNodeSelected(nos::fb::UUID const& nodeId) override {}
 	void OnNodeImported(nos::fb::Node const& appNode) override {}
 	void OnConnectionClosed() override {}
@@ -193,16 +193,6 @@ bool CreateSwapchain()
 
 rc<Renderpass> CreatePass()
 {
-	{
-		//vertex shader
-		std::vector<u8> spirv = ReadSpirv("triangle.vert.spv");
-		spirv.resize(spirv.size() & ~3);
-		if (auto vks = Shader::Create(GVkDevice.get(), spirv))
-		{
-			GVkDevice->RegisterGlobal<rc<Shader>>("TriangleVertex", std::move(vks));
-		}
-	}
-
 	{
 		//fragment shader
 		std::vector<u8> spirv = ReadSpirv("triangle.frag.spv");
@@ -400,6 +390,7 @@ int main()
 	if (re != VK_SUCCESS)
 	{
 		std::cout << "Failed to create output image" << std::endl;
+
 		return 0;
 	}
 
