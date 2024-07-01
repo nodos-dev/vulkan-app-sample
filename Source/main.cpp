@@ -65,6 +65,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		if (appNode)
 		{
 			NodeId = *appNode->id();
+			CreateTexturePinsInNodos();
 		}
 	}
 	void OnNodeUpdated(nos::fb::Node const& appNode) override 
@@ -75,6 +76,15 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		CreateTexturePinsInNodos();
 		
 	}
+
+	void OnNodeImported(nos::fb::Node const& appNode) override 
+	{
+		std::cout << "Node updated from Nodos" << std::endl;
+		NodeId = *appNode.id();
+
+		CreateTexturePinsInNodos();
+	}
+
 	void OnContextMenuRequested(nos::app::AppContextMenuRequest const& request) override {}
 	void OnContextMenuCommandFired(nos::app::AppContextMenuAction const& action) override {}
 	void OnNodeRemoved() override {}
@@ -83,7 +93,6 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 	void OnExecuteAppInfo(nos::app::AppExecuteInfo const* appExecuteInfo) override {}
 	void OnFunctionCall(nos::app::FunctionCall const* functionCall) override {}
 	void OnNodeSelected(nos::fb::UUID const& nodeId) override {}
-	void OnNodeImported(nos::fb::Node const& appNode) override {}
 	void OnConnectionClosed() override {}
 	void OnStateChanged(nos::app::ExecutionState newState) override {}
 	void OnConsoleCommand(nos::app::ConsoleCommand const* consoleCommand) override {}
@@ -274,6 +283,9 @@ int InitNosSDK()
 
 void CreateTexturePinsInNodos()
 {
+
+	std::vector<flatbuffers::Offset<nos::fb::Pin>> pins;
+	flatbuffers::FlatBufferBuilder fbb;
 	{
 		nos::sys::vulkan::TTexture Texture;
 		Texture.resolution = nos::sys::vulkan::SizePreset::CUSTOM;
@@ -301,14 +313,7 @@ void CreateTexturePinsInNodos()
 		std::vector<uint8_t> randomBytes = generateRandomBytes(numBytes);
 
 
-		std::vector<flatbuffers::Offset<nos::fb::Pin>> pins;
-		flatbuffers::FlatBufferBuilder fbb;
 		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Input", "nos.sys.vulkan.Texture", nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, false, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
-		auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::NONE, 0, &pins, 0, 0, 0, 0);
-		fbb.Finish(offset);
-		auto buf = fbb.Release();
-		auto root = flatbuffers::GetRoot<nos::PartialNodeUpdate>(buf.data());
-		client->SendPartialNodeUpdate(*root);
 	}
 	{
 		nos::sys::vulkan::TTexture Texture;
@@ -336,16 +341,14 @@ void CreateTexturePinsInNodos()
 		size_t numBytes = 16;
 		std::vector<uint8_t> randomBytes = generateRandomBytes(numBytes);
 
-		std::vector<flatbuffers::Offset<nos::fb::Pin>> pins;
-		flatbuffers::FlatBufferBuilder fbb;
 		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Output", "nos.sys.vulkan.Texture", nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, false, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
-		auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::NONE, 0, &pins, 0, 0, 0, 0);
-		fbb.Finish(offset);
-		auto buf = fbb.Release();
-		auto root = flatbuffers::GetRoot<nos::PartialNodeUpdate>(buf.data());
-		client->SendPartialNodeUpdate(*root);
 	}
 
+	auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::ANY, 0, &pins, 0, 0, 0, 0);
+	fbb.Finish(offset);
+	auto buf = fbb.Release();
+	auto root = flatbuffers::GetRoot<nos::PartialNodeUpdate>(buf.data());
+	client->SendPartialNodeUpdate(*root);
 }
 
 
