@@ -39,8 +39,8 @@ rc<CommandPool> pool;
 
 VkSurfaceKHR surface;
 GLFWwindow* window;
-const uint32_t WIDTH = 800;
-const uint32_t HEIGHT = 600;
+const uint32_t WIDTH = 1920;
+const uint32_t HEIGHT = 1080;
 
 VkSwapchainKHR swapchain;
 
@@ -370,7 +370,7 @@ int main()
 
 
 	ImageCreateInfo createInfo = {
-		.Extent = {800, 600},
+		.Extent = {1920, 1080},
 		.Format = VK_FORMAT_R8G8B8A8_UNORM,
 		.Usage = VK_IMAGE_USAGE_SAMPLED_BIT |
 				  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
