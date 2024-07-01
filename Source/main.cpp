@@ -203,8 +203,6 @@ rc<Renderpass> CreatePass()
 		}
 	}
 
-	rc<Shader> VS = GVkDevice->GetGlobal<rc<Shader>>("TriangleVertex");
-	VS = nullptr;
 	rc<Shader> PS = GVkDevice->GetGlobal<rc<Shader>>("TriangleFragment");
 	GraphicsPipeline::BlendMode blendMode;
 	blendMode.Enable = false;
@@ -215,7 +213,7 @@ rc<Renderpass> CreatePass()
 	blendMode.ColorOp = VK_BLEND_OP_ADD;
 	blendMode.AlphaOp = VK_BLEND_OP_MAX;
 
-	rc<Renderpass> RP = Renderpass::New(std::make_shared<GraphicsPipeline>(GVkDevice.get(), PS, VS,
+	rc<Renderpass> RP = Renderpass::New(std::make_shared<GraphicsPipeline>(GVkDevice.get(), PS, nullptr,
 		blendMode, 1));
 	GVkDevice->RegisterGlobal<rc<Renderpass>>("TrianglePass", RP);
 	
@@ -399,6 +397,14 @@ int main()
 	int frame = 0;
 	while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+		if (!client->IsConnected())
+		{
+			std::cout << "Reconnecting to Nodos..." << std::endl;
+			while (!client->TryConnect())
+			{
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+			}
+		}
 
 		uint32_t imageIndex; 
 		GVkDevice->AcquireNextImageKHR(swapchain, 10000, WaitSemaphores[frame]->Handle, 0, &imageIndex);
