@@ -1,0 +1,10 @@
+{
+    "release_globs": [
+        "Source/**",
+        "External/**",
+        "Shaders/**",
+        "compile.bat",
+        "CMakeLists.txt",
+        "README.md"
+    ]
+}
