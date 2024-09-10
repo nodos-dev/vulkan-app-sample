@@ -1,125 +1,51 @@
-# Copyright MediaZ Teknoloji A.S. All Rights Reserved.
+name: Release
 
-# This is a basic workflow to help you get started with Actions
-
-name: Modules Releases
-
-# Controls when the workflow will run
 on:
   push:
     branches: [ dev ]
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
     inputs:
+      build_all:
+        description: 'Build all modules'
+        required: false
+        default: false
+        type: boolean
       nodos_sdk_version:
         description: 'Nodos SDK Version'
         required: false
         default: ''
+        type: string
       clean:
-        description: 'Clean before publish'
+        description: 'Clean build'
         required: false
-        default: "false"
+        default: false
+        type: boolean
 
-env:
-  GH_USERNAME: "mediaz-bot"
-  GIT_EMAIL: "bot@nodos.dev"
-  GH_TOKEN: ${{ secrets.CI_TOKEN }}
-  NOSMAN_EXECUTABLE: "C:/Tools/nosman.exe"
-  RUST_BACKTRACE: 1
-  BUILD_NUMBER_STARTS_AT: 0
-  SAMPLE_PKG_NAME: "nos.sample.vkapp"
-  SAMPLE_PKG_VERSION: "0.1.0"
-
-# TODO: Support parallel runs
 concurrency:
-  group: single # For now, allow 1 run at a time.
-  cancel-in-progress: false # Queue up runs if one is already in progress.
+  group: single
+  cancel-in-progress: false
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  build:
-    name: Sample Release
+  set-build-number:
+    name: Set Build Number
     runs-on: self-hosted
+    outputs:
+      build_number: ${{ steps.offset-build-number.outputs.build_number }}
     steps:
-      - name: Update Git Credentials
-        continue-on-error: true
-        shell: bash
-        run: |
-          git credential-manager github login --username ${{ env.GH_USERNAME }} --token ${{ env.GH_TOKEN }} --force
-
       - name: Offset Build Number
-        id: build_number
+        id: offset-build-number
         shell: bash
-        run: echo "BUILD_NUMBER=$((${{ env.BUILD_NUMBER_STARTS_AT }} + ${{ github.run_number }}))" >> $GITHUB_ENV
-      
-      - name: Show Build Info
-        shell: bash
-        run: echo "Build number is $BUILD_NUMBER"
+        run: |
+          BUILD_NUMBER=$(( ${{ github.run_number }} + 0 ))
+          echo "build_number=$BUILD_NUMBER" >> $GITHUB_OUTPUT
 
-      - name: Clean Build
-        shell: pwsh
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.clean == 'true' }}
-        run: |
-          if (Test-Path -Path ./sample-${{ github.ref_name }}) { Remove-Item -Path ./sample-${{ github.ref_name }} -Recurse -Force }
-
-      - name: Cleanup
-        run: |
-          New-Item -ItemType Directory -Path ./sample-${{ github.ref_name }} -ErrorAction SilentlyContinue
-        shell: pwsh
-
-      - name: Setup Nodos Workspace (Latest)
-        if: ${{  github.event_name != 'workflow_dispatch' || github.event.inputs.nodos_sdk_version == '' }}
-        run: |
-          if (-not (Test-Path -Path ./workspace)) {
-            ${{ env.NOSMAN_EXECUTABLE }} --workspace ./workspace get
-          } else {
-            cd ./workspace
-            ./nosman.exe get
-            cd ..
-          }
-          echo "Updating system nosman"
-          Copy-Item -Path ./workspace/nosman.exe -Destination ${{ env.NOSMAN_EXECUTABLE }} -Force
-        shell: pwsh
-        working-directory: ./sample-${{ github.ref_name }}
-
-      - name: Setup Nodos Workspace (Specific Version)
-        if: ${{  github.event_name == 'workflow_dispatch' && github.event.inputs.nodos_sdk_version != '' }}
-        run: |
-          ${{ env.NOSMAN_EXECUTABLE }} --workspace ./workspace get --version "${{ github.event.inputs.nodos_sdk_version }}"
-        shell: pwsh
-        working-directory: ./sample-${{ github.ref_name }}
-
-      - name: Checkout
-        shell: pwsh
-        run: |
-          if (-not (Test-Path -Path ./sample-repo)) {
-            git clone --branch ${{ github.ref_name }} --depth 1 https://github.com/${{ github.repository }}.git --recurse-submodule --shallow-submodules ./sample-repo
-          }
-          cd ./sample-repo
-          git fetch origin
-          git checkout ${{ github.ref_name }}
-          git clean -ffd
-          git restore .
-          git pull --force
-          git submodule update --force --recursive --init
-          git fetch --tags
-          git status
-        working-directory: ./sample-${{ github.ref_name }}
-
-      - name: Setup Git
-        run: |
-          git config user.email "${{ env.GIT_EMAIL }}"
-          git config user.name "${{ env.GH_USERNAME }}"
-        working-directory: ./sample-${{ github.ref_name }}/sample-repo
-  
-      - name: Update Nosman Cache
-        shell: pwsh
-        run: |
-          ./nosman.exe rescan --fetch-index
-        working-directory: ./sample-${{ github.ref_name }}/workspace
-
-      - name: Release
-        shell: pwsh
-        run: |
-          ../workspace/nosman.exe --workspace ../workspace publish --type=generic --path . --name="${{ env.SAMPLE_PKG_NAME }}" --version="${{ env.SAMPLE_PKG_VERSION }}" --vendor=Nodos --version-suffix ".b${{ env.BUILD_NUMBER }}" --verbose --publisher-name "${{ env.GH_USERNAME }}" --publisher-email "${{ env.GIT_EMAIL }}"
-        working-directory: ./sample-${{ github.ref_name }}/sample-repo
+  call-release-modules:
+    name: Release Modules
+    needs: set-build-number
+    uses: mediaz/actions/.github/workflows/release-modules.yml@main
+    with:
+      ref_name: ${{ github.ref_name }}
+      build_all: ${{ github.event_name == 'workflow_dispatch' && fromJson(github.event.inputs.build_all) || false }}
+      nodos_sdk_version: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.nodos_sdk_version || '' }}
+      clean: ${{ github.event_name == 'workflow_dispatch' && fromJson(github.event.inputs.clean) || false }}
+      build_number: ${{ needs.set-build-number.outputs.build_number }}
