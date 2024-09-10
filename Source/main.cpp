@@ -317,7 +317,7 @@ void CreateTexturePinsInNodos()
 		std::vector<uint8_t> randomBytes = generateRandomBytes(numBytes);
 
 
-		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Input", "nos.sys.vulkan.Texture", nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, false, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
+		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Input", "nos.sys.vulkan.Texture", nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
 	}
 	{
 		nos::sys::vulkan::TTexture Texture;
@@ -345,7 +345,7 @@ void CreateTexturePinsInNodos()
 		size_t numBytes = 16;
 		std::vector<uint8_t> randomBytes = generateRandomBytes(numBytes);
 
-		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Output", "nos.sys.vulkan.Texture", nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, false, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
+		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Output", "nos.sys.vulkan.Texture", nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
 	}
 
 	auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::ANY, 0, &pins, 0, 0, 0, 0);
