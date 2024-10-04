@@ -51,10 +51,68 @@ VkSwapchainKHR swapchain;
 std::vector<rc<Semaphore>> WaitSemaphores;
 std::vector<rc<Semaphore>> SignalSemaphores;
 
-rc<Image> ShaderInput;
-rc<Image> ShaderOutput;
+struct ExternalTexture
+{
+	rc<Image> Image;
+	nos::fb::UUID Id;
+};
 
-void CreateTexturePinsInNodos();
+ExternalTexture ShaderInput;
+ExternalTexture ShaderOutput;
+
+void CreateTexturePinsInNodos(const nos::fb::Node& appNode);
+
+rc<nos::vk::Image> ImportTexture(uint8_t const* data, size_t size)
+{
+	nos::sys::vulkan::Texture const& tex = *flatbuffers::GetRoot<nos::sys::vulkan::Texture>(data);
+	auto extInfo = tex.external_memory();
+	auto texInfo = nosResourceShareInfo{
+		.Memory =
+			nosMemoryInfo{
+				.Handle = tex.handle(),
+				.Size = tex.size_in_bytes(),
+				.ExternalMemory = {
+					.HandleType = extInfo ? static_cast<nosExternalMemoryHandleType>(extInfo->handle_type()) : NOS_EXTERNAL_MEMORY_HANDLE_TYPE_NONE,
+					.Handle = extInfo ? extInfo->handle() : 0,
+					.Offset = tex.offset(),
+					.AllocationSize = extInfo ? extInfo->allocation_size() : 0,
+					.PID = extInfo ? extInfo->pid() : 0
+				}
+			},
+		.Info =
+			nosResourceInfo{
+				.Type = NOS_RESOURCE_TYPE_TEXTURE,
+				.Texture =
+					nosTextureInfo{
+						.Width = tex.width(),
+						.Height = tex.height(),
+						.Format = (nosFormat)tex.format(),
+						.Filter = (nosTextureFilter)tex.filtering(),
+						.Usage = (nosImageUsage)tex.usage(),
+						.FieldType = (nosTextureFieldType)tex.field_type(),
+					},
+			},
+	};
+	auto& ext = texInfo.Memory.ExternalMemory;
+	MemoryExportInfo importInfo = {
+		.HandleType = static_cast<uint32_t>(ext.HandleType),
+		.PID = ext.PID,
+		.Handle = HANDLE(ext.Handle),
+		.Offset = ext.Offset,
+		.Size = texInfo.Memory.Size,
+		.AllocationSize = ext.AllocationSize
+	};
+	ImageCreateInfo createInfo = {
+		.Extent = {texInfo.Info.Texture.Width, texInfo.Info.Texture.Height},
+		.Format = (VkFormat)texInfo.Info.Texture.Format,
+		.Usage = (VkImageUsageFlags)texInfo.Info.Texture.Usage,
+		.ExternalMemoryHandleType = (uint32_t)ext.HandleType,
+		.Imported = &importInfo,
+	};
+
+	VkResult re;
+	return nos::vk::Image::New(GVkDevice.get(), createInfo, &re);
+}
 
 struct SampleEventDelegates : nos::app::IEventDelegates
 {
@@ -69,7 +127,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		if (appNode)
 		{
 			NodeId = *appNode->id();
-			CreateTexturePinsInNodos();
+			CreateTexturePinsInNodos(*appNode);
 		}
 	}
 	void OnNodeUpdated(nos::fb::Node const& appNode) override 
@@ -77,7 +135,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		std::cout << "Node updated from Nodos" << std::endl;
 		NodeId = *appNode.id();
 
-		CreateTexturePinsInNodos();
+		CreateTexturePinsInNodos(appNode);
 		
 	}
 
@@ -86,13 +144,28 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		std::cout << "Node updated from Nodos" << std::endl;
 		NodeId = *appNode.id();
 
-		CreateTexturePinsInNodos();
+		CreateTexturePinsInNodos(appNode);
 	}
 
 	void OnContextMenuRequested(nos::app::AppContextMenuRequest const& request) override {}
 	void OnContextMenuCommandFired(nos::app::AppContextMenuAction const& action) override {}
 	void OnNodeRemoved() override {}
-	void OnPinValueChanged(nos::fb::UUID const& pinId, uint8_t const* data, size_t size, bool reset, uint64_t frameNumber) override {}
+	void OnPinValueChanged(nos::fb::UUID const& pinId, uint8_t const* data, size_t size, bool reset, uint64_t frameNumber) override
+	{
+		std::cout << "Pin value changed" << std::endl;
+		if (pinId == ShaderInput.Id || pinId == ShaderOutput.Id)
+		{
+			auto imported = ImportTexture(data, size);
+			if (pinId == ShaderInput.Id)
+			{
+				ShaderInput.Image = imported;
+			}
+			else if (pinId == ShaderOutput.Id)
+			{
+				ShaderOutput.Image = imported;
+			}
+		}
+	}
 	void OnPinShowAsChanged(nos::fb::UUID const& pinId, nos::fb::ShowAs newShowAs) override {}
 	void OnExecuteAppInfo(nos::app::AppExecuteInfo const* appExecuteInfo) override {}
 	void OnFunctionCall(nos::app::FunctionCall const* functionCall) override {}
@@ -125,17 +198,19 @@ std::vector<u8> ReadSpirv(std::string const& file)
                            std::istreambuf_iterator<u8>());
 }
 
-std::vector<uint8_t> generateRandomBytes(size_t numBytes) {
-    std::vector<uint8_t> randomBytes(numBytes);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<uint16_t> dis(0, std::numeric_limits<uint8_t>::max());
+nos::fb::UUID GenerateRandomUUID() {
+	nos::fb::UUID uuid;
+	std::vector<uint8_t> randomBytes(16);
+	std::random_device rd;
+	std::mt19937 gen(rd());
+	std::uniform_int_distribution<uint16_t> dis(0, std::numeric_limits<uint8_t>::max());
 
-    for (size_t i = 0; i < numBytes; ++i) {
-        randomBytes[i] = static_cast<uint8_t>(dis(gen));
-    }
-
-    return randomBytes;}
+	for (size_t i = 0; i < 16; ++i) {
+		randomBytes[i] = static_cast<uint8_t>(dis(gen));
+	}
+	memcpy(&uuid, randomBytes.data(), 16);
+	return uuid;
+}
 
 bool InitWindow()
 {
@@ -285,70 +360,79 @@ int InitNosSDK()
 	}
 }
 
-void CreateTexturePinsInNodos()
+void CreateTexturePinsInNodos(const nos::fb::Node& appNode)
 {
-
+	std::cout << "Creating pins" << std::endl;
+	bool createPins = !appNode.pins() || appNode.pins()->size() == 0;
 	std::vector<flatbuffers::Offset<nos::fb::Pin>> pins;
 	flatbuffers::FlatBufferBuilder fbb;
+	if (createPins)
 	{
-		nos::sys::vulkan::TTexture Texture;
-		Texture.resolution = nos::sys::vulkan::SizePreset::CUSTOM;
-		Texture.width = ShaderInput->GetExtent().width;
-		Texture.height = ShaderInput->GetExtent().height;
-		Texture.format = nos::sys::vulkan::Format(ShaderInput->GetFormat());
-		Texture.usage = nos::sys::vulkan::ImageUsage(NOS_IMAGE_USAGE_RENDER_TARGET | NOS_IMAGE_USAGE_SAMPLED | NOS_IMAGE_USAGE_TRANSFER_SRC | NOS_IMAGE_USAGE_TRANSFER_DST);
-		auto& Ext = Texture.external_memory;
-		Ext.mutate_handle_type(NOS_EXTERNAL_MEMORY_HANDLE_TYPE_WIN32);
-		Ext.mutate_handle((u64)ShaderInput->GetExportInfo().Handle);
-		Ext.mutate_allocation_size((u64)ShaderInput->GetExportInfo().AllocationSize);
-		Ext.mutate_pid((u64)ShaderInput->GetExportInfo().PID);
-		Texture.unmanaged = false;
-		Texture.unscaled = true;
-		Texture.handle = 0;
-		Texture.offset = ShaderInput->GetExportInfo().Offset;
+		{
+			//nos::sys::vulkan::TTexture Texture;
+			//Texture.resolution = nos::sys::vulkan::SizePreset::CUSTOM;
+			//Texture.width = ShaderInput->GetExtent().width;
+			//Texture.height = ShaderInput->GetExtent().height;
+			//Texture.format = nos::sys::vulkan::Format(ShaderInput->GetFormat());
+			//Texture.usage = nos::sys::vulkan::ImageUsage(NOS_IMAGE_USAGE_RENDER_TARGET | NOS_IMAGE_USAGE_SAMPLED | NOS_IMAGE_USAGE_TRANSFER_SRC | NOS_IMAGE_USAGE_TRANSFER_DST);
+			//auto& Ext = Texture.external_memory;
+			//Ext.mutate_handle_type(NOS_EXTERNAL_MEMORY_HANDLE_TYPE_WIN32);
+			//Ext.mutate_handle((u64)ShaderInput->GetExportInfo().Handle);
+			//Ext.mutate_allocation_size((u64)ShaderInput->GetExportInfo().AllocationSize);
+			//Ext.mutate_pid((u64)ShaderInput->GetExportInfo().PID);
+			//Texture.unmanaged = false;
+			//Texture.unscaled = true;
+			//Texture.handle = 0;
+			//Texture.offset = ShaderInput->GetExportInfo().Offset;
 
-		flatbuffers::FlatBufferBuilder fb;
-		auto offset1 = nos::sys::vulkan::CreateTexture(fb, &Texture);
-		fb.Finish(offset1);
-		nos::Buffer buffer = fb.Release();
-		std::vector<uint8_t>data = buffer;
+			//flatbuffers::FlatBufferBuilder fb;
+			//auto offset1 = nos::sys::vulkan::CreateTexture(fb, &Texture);
+			//fb.Finish(offset1);
+			//nos::Buffer buffer = fb.Release();
+			//std::vector<uint8_t>data = buffer;
 
-		size_t numBytes = 16;
-		std::vector<uint8_t> randomBytes = generateRandomBytes(numBytes);
+			ShaderInput.Id = GenerateRandomUUID();
+			pins.push_back(nos::fb::CreatePinDirect(fbb, &ShaderInput.Id, "Shader Input", "nos.sys.vulkan.Texture", nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
+		}
+		{
+			//nos::sys::vulkan::TTexture Texture;
+			//Texture.resolution = nos::sys::vulkan::SizePreset::CUSTOM;
+			//Texture.width = ShaderOutput->GetExtent().width;
+			//Texture.height = ShaderOutput->GetExtent().height;
+			//Texture.format = nos::sys::vulkan::Format(ShaderOutput->GetFormat());
+			//Texture.usage = nos::sys::vulkan::ImageUsage(NOS_IMAGE_USAGE_RENDER_TARGET | NOS_IMAGE_USAGE_SAMPLED | NOS_IMAGE_USAGE_TRANSFER_SRC | NOS_IMAGE_USAGE_TRANSFER_DST);
+			//auto& Ext = Texture.external_memory;
+			//Ext.mutate_handle_type(NOS_EXTERNAL_MEMORY_HANDLE_TYPE_WIN32);
+			//Ext.mutate_handle((u64)ShaderOutput->GetExportInfo().Handle);
+			//Ext.mutate_allocation_size((u64)ShaderOutput->GetExportInfo().AllocationSize);
+			//Ext.mutate_pid((u64)ShaderOutput->GetExportInfo().PID);
+			//Texture.unmanaged = false;
+			//Texture.unscaled = true;
+			//Texture.handle = 0;
+			//Texture.offset = ShaderOutput->GetExportInfo().Offset;
 
+			//flatbuffers::FlatBufferBuilder fb;
+			//auto offset1 = nos::sys::vulkan::CreateTexture(fb, &Texture);
+			//fb.Finish(offset1);
+			//nos::Buffer buffer = fb.Release();
+			//std::vector<uint8_t>data = buffer;
 
-		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Input", "nos.sys.vulkan.Texture", nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
+			ShaderOutput.Id = GenerateRandomUUID();
+			pins.push_back(nos::fb::CreatePinDirect(fbb, &ShaderOutput.Id, "Shader Output", "nos.sys.vulkan.Texture", nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
+		}
 	}
+	else
 	{
-		nos::sys::vulkan::TTexture Texture;
-		Texture.resolution = nos::sys::vulkan::SizePreset::CUSTOM;
-		Texture.width = ShaderOutput->GetExtent().width;
-		Texture.height = ShaderOutput->GetExtent().height;
-		Texture.format = nos::sys::vulkan::Format(ShaderOutput->GetFormat());
-		Texture.usage = nos::sys::vulkan::ImageUsage(NOS_IMAGE_USAGE_RENDER_TARGET | NOS_IMAGE_USAGE_SAMPLED | NOS_IMAGE_USAGE_TRANSFER_SRC | NOS_IMAGE_USAGE_TRANSFER_DST);
-		auto& Ext = Texture.external_memory;
-		Ext.mutate_handle_type(NOS_EXTERNAL_MEMORY_HANDLE_TYPE_WIN32);
-		Ext.mutate_handle((u64)ShaderOutput->GetExportInfo().Handle);
-		Ext.mutate_allocation_size((u64)ShaderOutput->GetExportInfo().AllocationSize);
-		Ext.mutate_pid((u64)ShaderOutput->GetExportInfo().PID);
-		Texture.unmanaged = false;
-		Texture.unscaled = true;
-		Texture.handle = 0;
-		Texture.offset = ShaderOutput->GetExportInfo().Offset;
-
-		flatbuffers::FlatBufferBuilder fb;
-		auto offset1 = nos::sys::vulkan::CreateTexture(fb, &Texture);
-		fb.Finish(offset1);
-		nos::Buffer buffer = fb.Release();
-		std::vector<uint8_t>data = buffer;
-
-		size_t numBytes = 16;
-		std::vector<uint8_t> randomBytes = generateRandomBytes(numBytes);
-
-		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Output", "nos.sys.vulkan.Texture", nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
+		for (auto pin : *appNode.pins())
+		{
+			if (pin->show_as() == nos::fb::ShowAs::INPUT_PIN)
+				ShaderInput.Id = *pin->id();
+			else if (pin->show_as() == nos::fb::ShowAs::OUTPUT_PIN)
+				ShaderOutput.Id = *pin->id();
+		}
 	}
 
-	auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::ANY, 0, &pins, 0, 0, 0, 0);
+	auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::NONE, 0, &pins, 0, 0, 0, 0);
 	fbb.Finish(offset);
 	auto buf = fbb.Release();
 	auto root = flatbuffers::GetRoot<nos::PartialNodeUpdate>(buf.data());
@@ -371,34 +455,6 @@ int main()
 	CreateSurface();
 	CreateSwapchain();
 
-
-
-	ImageCreateInfo createInfo = {
-		.Extent = {1920, 1080},
-		.Format = VK_FORMAT_R8G8B8A8_UNORM,
-		.Usage = VK_IMAGE_USAGE_SAMPLED_BIT |
-				  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-				  VK_IMAGE_USAGE_STORAGE_BIT |
-				  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-				  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-		.ExternalMemoryHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
-	};
-
-	VkResult re;
-	ShaderInput = Image::New(GVkDevice.get(), createInfo, &re);
-	if (re != VK_SUCCESS)
-	{
-		std::cout << "Failed to create input image" << std::endl;
-		return 0;
-	}
-	ShaderOutput = Image::New(GVkDevice.get(), createInfo, &re);
-	if (re != VK_SUCCESS)
-	{
-		std::cout << "Failed to create output image" << std::endl;
-
-		return 0;
-	}
-
 	InitNosSDK();
 	
 	int frame = 0;
@@ -417,23 +473,28 @@ int main()
 		GVkDevice->AcquireNextImageKHR(swapchain, 10000, WaitSemaphores[frame]->Handle, 0, &imageIndex);
 		auto cmd = pool->BeginCmd();
 
-		RP->BindResource("Input", ShaderInput, VkFilter::VK_FILTER_NEAREST);
-		RP->TransitionInput(cmd, "Input", ShaderInput);
+		bool areTexturesReady = ShaderInput.Image && ShaderOutput.Image;
 
-		Renderpass::ExecPassInfo info{
-		  .BeginInfo = {.OutImage = ShaderOutput,
-		  			  .DepthAttachment = std::nullopt,
-		  			  .Wireframe = false,
-		  			  .Clear = true,
-		  			  .FrameNumber = 0,
-		  			  .DeltaSeconds = 0.f,
-		  			  .ClearCol = {0.0f,0.0f,0.0f,1.0f}},
-					  .VtxData = 0};
+		if (areTexturesReady)
+		{
+			RP->BindResource("Input", ShaderInput.Image, VkFilter::VK_FILTER_NEAREST);
+			RP->TransitionInput(cmd, "Input", ShaderInput.Image);
 
-		RP->Exec(cmd, info);
+			Renderpass::ExecPassInfo info{
+			  .BeginInfo = {.OutImage = ShaderOutput.Image,
+		  				  .DepthAttachment = std::nullopt,
+		  				  .Wireframe = false,
+		  				  .Clear = true,
+		  				  .FrameNumber = 0,
+		  				  .DeltaSeconds = 0.f,
+		  				  .ClearCol = {0.0f,0.0f,0.0f,1.0f}},
+						  .VtxData = 0};
+
+			RP->Exec(cmd, info);
 		
-		//copy from texture to swapchain image
-		swapchainInfo.Images[imageIndex]->CopyFrom(cmd, ShaderOutput);
+			//copy from texture to swapchain image
+			swapchainInfo.Images[imageIndex]->BlitFrom(cmd, ShaderOutput.Image, VkFilter::VK_FILTER_NEAREST);
+		}
 
 		swapchainInfo.Images[imageIndex]->Transition(cmd, ImageState{
 				  .StageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
