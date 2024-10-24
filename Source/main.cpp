@@ -22,8 +22,6 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
-#define GLFW_EXPOSE_NATIVE_WIN32
-#include <GLFW/glfw3native.h>
 
 #include "stb_image.h"
 #include "stb_image_write.h"
@@ -63,7 +61,28 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 	nos::app::IAppServiceClient* Client;
 	nos::fb::UUID NodeId{};
 
-	void OnAppConnected(const nos::fb::Node* appNode) override
+	void HandleEvent(const nos::app::EngineEvent* event) override
+	{
+		using namespace nos::app;
+		switch (event->event_type())
+		{
+		case EngineEventUnion::AppConnectedEvent: {
+			OnAppConnected(event->event_as<AppConnectedEvent>()->node());
+			break;
+		}
+		case EngineEventUnion::FullNodeUpdate: {
+			OnNodeUpdated(*event->event_as<nos::FullNodeUpdate>()->node());
+			break;
+		}
+		case EngineEventUnion::NodeImported: {
+			OnNodeImported(*event->event_as<nos::app::NodeImported>()->node());
+			break;
+		}
+		}
+
+	}
+
+	void OnAppConnected(const nos::fb::Node* appNode)
 	{
 		std::cout << "Connected to Nodos" << std::endl;
 		if (appNode)
@@ -72,7 +91,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 			CreateTexturePinsInNodos();
 		}
 	}
-	void OnNodeUpdated(nos::fb::Node const& appNode) override 
+	void OnNodeUpdated(nos::fb::Node const& appNode) 
 	{
 		std::cout << "Node updated from Nodos" << std::endl;
 		NodeId = *appNode.id();
@@ -81,7 +100,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		
 	}
 
-	void OnNodeImported(nos::fb::Node const& appNode) override 
+	void OnNodeImported(nos::fb::Node const& appNode) 
 	{
 		std::cout << "Node updated from Nodos" << std::endl;
 		NodeId = *appNode.id();
@@ -89,21 +108,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		CreateTexturePinsInNodos();
 	}
 
-	void OnContextMenuRequested(nos::app::AppContextMenuRequest const& request) override {}
-	void OnContextMenuCommandFired(nos::app::AppContextMenuAction const& action) override {}
-	void OnNodeRemoved() override {}
-	void OnPinValueChanged(nos::fb::UUID const& pinId, uint8_t const* data, size_t size, bool reset, uint64_t frameNumber) override {}
-	void OnPinShowAsChanged(nos::fb::UUID const& pinId, nos::fb::ShowAs newShowAs) override {}
-	void OnExecuteAppInfo(nos::app::AppExecuteInfo const* appExecuteInfo) override {}
-	void OnFunctionCall(nos::app::FunctionCall const* functionCall) override {}
-	void OnNodeSelected(nos::fb::UUID const& nodeId) override {}
 	void OnConnectionClosed() override {}
-	void OnStateChanged(nos::app::ExecutionState newState) override {}
-	void OnConsoleCommand(nos::app::ConsoleCommand const* consoleCommand) override {}
-	void OnConsoleAutoCompleteSuggestionRequest(nos::app::ConsoleAutoCompleteSuggestionRequest const* consoleAutoCompleteSuggestionRequest) override {}
-	void OnLoadNodesOnPaths(nos::app::LoadNodesOnPaths const* loadNodesOnPathsRequest) override {}
-	void OnCloseApp() override {}
-	void OnExecuteStart(nos::app::AppExecuteStart const* appExecuteStart) override {}
 };
 
 nos::app::IAppServiceClient* client;
@@ -120,9 +125,19 @@ SwapchainInfo swapchainInfo;
 
 std::vector<u8> ReadSpirv(std::string const& file)
 {
-    std::basic_ifstream<u8, std::char_traits<u8>> f(file, std::ios::in | std::ios::binary);
-    return std::vector<u8>((std::istreambuf_iterator<u8>(f)),
-                           std::istreambuf_iterator<u8>());
+	if(!std::filesystem::exists(file))
+	{
+		return {};
+	}
+	std::vector<uint8_t> spirv;
+	{
+		std::ifstream fileStream(file, std::ios::binary);
+		fileStream.seekg(0, std::ios::end);
+		spirv.resize(fileStream.tellg());
+		fileStream.seekg(0, std::ios::beg);
+		fileStream.read((char*)spirv.data(), spirv.size());
+	}
+	return spirv;
 }
 
 std::vector<uint8_t> generateRandomBytes(size_t numBytes) {
@@ -154,6 +169,7 @@ bool CreateSurface()
 		throw std::runtime_error("failed to create window surface!");
 		return false;
 	}
+	return true;
 }
 
 bool CreateSwapchain()
@@ -197,8 +213,8 @@ bool CreateSwapchain()
 
 	for (int i = 0; i < swapchainInfo.FrameCount; i++)
 	{
-		WaitSemaphores.push_back(Semaphore::New(GVkDevice.get(), true));
-		SignalSemaphores.push_back(Semaphore::New(GVkDevice.get(), true));
+		WaitSemaphores.push_back(Semaphore::New(GVkDevice.get(), VkSemaphoreType::VK_SEMAPHORE_TYPE_BINARY));
+		SignalSemaphores.push_back(Semaphore::New(GVkDevice.get(), VkSemaphoreType::VK_SEMAPHORE_TYPE_BINARY));
 	}
 
 	return err == VK_SUCCESS ? true : false;
@@ -217,7 +233,7 @@ rc<Renderpass> CreatePass()
 	}
 
 	rc<Shader> PS = GVkDevice->GetGlobal<rc<Shader>>("TriangleFragment");
-	GraphicsPipeline::BlendMode blendMode;
+	nos::vk::BlendMode blendMode;
 	blendMode.Enable = false;
 	blendMode.SrcColorFactor = VK_BLEND_FACTOR_SRC_ALPHA;
 	blendMode.DstColorFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
@@ -244,12 +260,23 @@ int InitNosSDK()
 	nos::app::FN_MakeAppServiceClient* pfnMakeAppServiceClient = nullptr;
 	nos::app::FN_ShutdownClient* pfnShutdownClient = nullptr;
 
+#if defined(_WIN32)
 	HMODULE sdkModule = LoadLibrary(NODOS_APP_SDK_DLL);
 	if (sdkModule) {
 		pfnCheckSDKCompatibility = (nos::app::FN_CheckSDKCompatibility*)GetProcAddress(sdkModule, "CheckSDKCompatibility");
 		pfnMakeAppServiceClient = (nos::app::FN_MakeAppServiceClient*)GetProcAddress(sdkModule, "MakeAppServiceClient");
 		pfnShutdownClient = (nos::app::FN_ShutdownClient*)GetProcAddress(sdkModule, "ShutdownClient");
 	}
+#elif defined(__linux__)
+	void* sdkModule = dlopen(NODOS_APP_SDK_DLL, RTLD_LAZY);
+	if (sdkModule) {
+		pfnCheckSDKCompatibility = (nos::app::FN_CheckSDKCompatibility*)dlsym(sdkModule, "CheckSDKCompatibility");
+		pfnMakeAppServiceClient = (nos::app::FN_MakeAppServiceClient*)dlsym(sdkModule, "MakeAppServiceClient");
+		pfnShutdownClient = (nos::app::FN_ShutdownClient*)dlsym(sdkModule, "ShutdownClient");
+	}
+#else
+#error "Unsupported platform"
+#endif
 	else {
 		std::cerr << "Failed to load Nodos SDK" << std::endl;
 		return -1;
@@ -283,11 +310,11 @@ int InitNosSDK()
 		std::cout << "Connecting to Nodos..." << std::endl;
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
+	return 0;
 }
 
 void CreateTexturePinsInNodos()
 {
-
 	std::vector<flatbuffers::Offset<nos::fb::Pin>> pins;
 	flatbuffers::FlatBufferBuilder fbb;
 	{
@@ -296,9 +323,9 @@ void CreateTexturePinsInNodos()
 		Texture.width = ShaderInput->GetExtent().width;
 		Texture.height = ShaderInput->GetExtent().height;
 		Texture.format = nos::sys::vulkan::Format(ShaderInput->GetFormat());
-		Texture.usage = nos::sys::vulkan::ImageUsage(NOS_IMAGE_USAGE_RENDER_TARGET | NOS_IMAGE_USAGE_SAMPLED | NOS_IMAGE_USAGE_TRANSFER_SRC | NOS_IMAGE_USAGE_TRANSFER_DST);
+		Texture.usage = nos::sys::vulkan::ImageUsage(ShaderInput->Usage);
 		auto& Ext = Texture.external_memory;
-		Ext.mutate_handle_type(NOS_EXTERNAL_MEMORY_HANDLE_TYPE_WIN32);
+		Ext.mutate_handle_type(ShaderInput->GetExportInfo().HandleType);
 		Ext.mutate_handle((u64)ShaderInput->GetExportInfo().Handle);
 		Ext.mutate_allocation_size((u64)ShaderInput->GetExportInfo().AllocationSize);
 		Ext.mutate_pid((u64)ShaderInput->GetExportInfo().PID);
@@ -325,9 +352,9 @@ void CreateTexturePinsInNodos()
 		Texture.width = ShaderOutput->GetExtent().width;
 		Texture.height = ShaderOutput->GetExtent().height;
 		Texture.format = nos::sys::vulkan::Format(ShaderOutput->GetFormat());
-		Texture.usage = nos::sys::vulkan::ImageUsage(NOS_IMAGE_USAGE_RENDER_TARGET | NOS_IMAGE_USAGE_SAMPLED | NOS_IMAGE_USAGE_TRANSFER_SRC | NOS_IMAGE_USAGE_TRANSFER_DST);
+		Texture.usage = nos::sys::vulkan::ImageUsage(ShaderOutput->Usage);
 		auto& Ext = Texture.external_memory;
-		Ext.mutate_handle_type(NOS_EXTERNAL_MEMORY_HANDLE_TYPE_WIN32);
+		Ext.mutate_handle_type(ShaderOutput->GetExportInfo().HandleType);
 		Ext.mutate_handle((u64)ShaderOutput->GetExportInfo().Handle);
 		Ext.mutate_allocation_size((u64)ShaderOutput->GetExportInfo().AllocationSize);
 		Ext.mutate_pid((u64)ShaderOutput->GetExportInfo().PID);
@@ -355,10 +382,18 @@ void CreateTexturePinsInNodos()
 	client->SendPartialNodeUpdate(*root);
 }
 
-
-
 int main() 
 {
+	GHandleImporter = {
+		.DuplicateHandle = [](NOS_PID pid, NOS_HANDLE handle) -> std::optional<NOS_HANDLE>
+		{
+			return client->DuplicateHandle(handle);
+		},
+		.CloseHandle = [](NOS_HANDLE handle)
+		{
+			client->CloseHandle(handle);
+		}
+	};
 	context = Context::New();
 	if (context->Devices.empty())
 		return 0;
@@ -371,8 +406,6 @@ int main()
 	CreateSurface();
 	CreateSwapchain();
 
-
-
 	ImageCreateInfo createInfo = {
 		.Extent = {1920, 1080},
 		.Format = VK_FORMAT_R8G8B8A8_UNORM,
@@ -381,7 +414,6 @@ int main()
 				  VK_IMAGE_USAGE_STORAGE_BIT |
 				  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
 				  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-		.ExternalMemoryHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
 	};
 
 	VkResult re;
@@ -455,7 +487,7 @@ int main()
 		pi.waitSemaphoreCount = 1;
 		VkResult res;
 		pi.pResults = &res;
-		NOSVK_ASSERT(GVkDevice->Queue->PresentKHR(&pi));
+		NOSVK_ASSERT(GVkDevice->MainQueue->PresentKHR(&pi));
 
 		frame = (frame + 1) % swapchainInfo.FrameCount;
     }
