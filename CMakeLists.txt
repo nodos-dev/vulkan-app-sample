@@ -28,8 +28,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY $<1:${CMAKE_CURRENT_SOURCE_DIR}/bin>)
 if (DEFINED NODOS_PATH)
     # Use nosman to get SDK PATH
     cmake_path(SET NODOS_EFFECTIVE_PATH ${NODOS_PATH})
-	get_filename_component(NODOS_WORKSPACE_DIR ${NODOS_EFFECTIVE_PATH} DIRECTORY)
-    execute_process(COMMAND ${NODOS_PATH} --workspace "${NODOS_WORKSPACE_DIR}" sdk-info "17.0.0" process OUTPUT_VARIABLE NODOS_SDK_INFO ERROR_VARIABLE NODOS_SDK_INFO_ERROR)
+    get_filename_component(NODOS_WORKSPACE_DIR ${NODOS_EFFECTIVE_PATH} DIRECTORY)
+    set(NOSMAN_WORKSPACE_DIR ${NODOS_WORKSPACE_DIR})
+    set(NOSMAN_EXECUTABLE ${NODOS_PATH})
+    execute_process(COMMAND ${NODOS_PATH} --workspace "${NODOS_WORKSPACE_DIR}" sdk-info "17.2.0" process OUTPUT_VARIABLE NODOS_SDK_INFO ERROR_VARIABLE NODOS_SDK_INFO_ERROR)
     if (NODOS_SDK_INFO_ERROR)
         message(FATAL_ERROR "Failed to get Nodos SDK Info: \n${NODOS_SDK_INFO_ERROR}")
     endif()
@@ -39,10 +41,15 @@ if (DEFINED NODOS_PATH)
     # Make path cross-platform
     string(REPLACE "\\" "/" NODOS_SDK_DIR ${NODOS_SDK_DIR})
 else()
-    if (NOT DEFINED NODOS_SDK_DIR)
-        message(FATAL_ERROR "NODOS_SDK_DIR or NODOS_WORKSPACE_DIR is not defined")
-    endif()
+    message(FATAL_ERROR "NODOS_PATH is not defined")
 endif()
+
+include(${NODOS_WORKSPACE_DIR}/Toolchain/CMake/Scripts/Utils.cmake)
+include(${NODOS_WORKSPACE_DIR}/Toolchain/CMake/Scripts/Projects.cmake)
+
+# Get nos.sys.vulkan
+nos_get_module("nos.sys.vulkan" "5.8" NOS_SYS_VULKAN_TARGET)
+message(STATUS "nos.sys.vulkan target: ${NOS_SYS_VULKAN_TARGET}")
 
 list(APPEND CMAKE_MODULE_PATH ${NODOS_SDK_DIR}/cmake)
 add_library(nosAppSDK INTERFACE)
@@ -61,7 +68,7 @@ else ()
 message(FATAL_ERROR "Unsupported platform")
 endif()
 
-target_link_libraries(${PROJECT_NAME} PRIVATE nosVulkan stb glfw nosAppSDK)
+target_link_libraries(${PROJECT_NAME} PRIVATE nosVulkan stb glfw nosAppSDK ${NOS_SYS_VULKAN_TARGET})
 
 # Compile shaders as post build step
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
