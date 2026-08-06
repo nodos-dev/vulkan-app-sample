@@ -16,6 +16,9 @@
 #include <vector>
 #include <string>
 #include <random>
+#include <deque>
+#include <mutex>
+#include <optional>
 
 
 
@@ -27,13 +30,24 @@
 #include "stb_image_write.h"
 
 // Nodos
+#if defined(_WIN32)
+#include <Windows.h>
+#elif defined(__linux__)
+#include <dlfcn.h>
+#endif
 #include "CommonEvents_generated.h"
 #include <nosFlatBuffersCommon.h>
 #include <Nodos/AppAPI.h>
-#include "nosVulkanSubsystem/nosVulkanSubsystem.h"
+#include <Nodos/AppHelpers.hpp>
+#include <Nodos/UUID.hpp>
+#include <nosSysVulkan/nosVulkanSubsystem.h>
+#include <nosSysVulkan/ResourceShare_generated.h>
 
 
 using namespace nos::vk;
+// rc<> moved out of nos::vk into nosCppUtilities' nos namespace. Pulled in by name rather than
+// with a using-directive, since nos::Buffer would otherwise collide with nos::vk::Buffer.
+using nos::rc;
 
 rc<Context> context;
 rc<Device> GVkDevice;
@@ -52,67 +66,116 @@ std::vector<rc<Semaphore>> SignalSemaphores;
 rc<Image> ShaderInput;
 rc<Image> ShaderOutput;
 
-void CreateTexturePinsInNodos();
-
-struct SampleEventDelegates : nos::app::IEventDelegates
+// Loads App SDK entry points out of the shared library for AppApi/AppServiceClient. The SDK no
+// longer exposes the FN_* procedures as nos::app members for the app to resolve by hand.
+struct SampleProcLoader final : nos::app::IAppApiProcLoader
 {
-	SampleEventDelegates(nos::app::IAppServiceClient* client) : Client(client) {}
+#if defined(_WIN32)
+	using ModuleHandle = HMODULE;
+#else
+	using ModuleHandle = void*;
+#endif
 
-	nos::app::IAppServiceClient* Client;
-	nos::fb::UUID NodeId{};
-
-	void HandleEvent(const nos::app::EngineEvent* event) override
+	explicit SampleProcLoader(ModuleHandle module) : Module(module) {}
+	~SampleProcLoader()
 	{
-		using namespace nos::app;
-		switch (event->event_type())
-		{
-		case EngineEventUnion::AppConnectedEvent: {
-			OnAppConnected(event->event_as<AppConnectedEvent>()->node());
-			break;
-		}
-		case EngineEventUnion::FullNodeUpdate: {
-			OnNodeUpdated(*event->event_as<nos::FullNodeUpdate>()->node());
-			break;
-		}
-		case EngineEventUnion::NodeImported: {
-			OnNodeImported(*event->event_as<nos::app::NodeImported>()->node());
-			break;
-		}
-		}
-
+#if defined(_WIN32)
+		::FreeLibrary(Module);
+#else
+		::dlclose(Module);
+#endif
 	}
 
-	void OnAppConnected(const nos::fb::Node* appNode)
+	ProcFuncPtr GetProcAddress(const char* funcName) const override
 	{
-		std::cout << "Connected to Nodos" << std::endl;
-		if (appNode)
-		{
-			NodeId = *appNode->id();
-			CreateTexturePinsInNodos();
-		}
-	}
-	void OnNodeUpdated(nos::fb::Node const& appNode) 
-	{
-		std::cout << "Node updated from Nodos" << std::endl;
-		NodeId = *appNode.id();
-
-		CreateTexturePinsInNodos();
-		
+#if defined(_WIN32)
+		return reinterpret_cast<ProcFuncPtr>(::GetProcAddress(Module, funcName));
+#else
+		return reinterpret_cast<ProcFuncPtr>(::dlsym(Module, funcName));
+#endif
 	}
 
-	void OnNodeImported(nos::fb::Node const& appNode) 
-	{
-		std::cout << "Node updated from Nodos" << std::endl;
-		NodeId = *appNode.id();
-
-		CreateTexturePinsInNodos();
-	}
-
-	void OnConnectionClosed() override {}
+	ModuleHandle Module;
 };
 
-nos::app::IAppServiceClient* client;
-SampleEventDelegates* eventDelegates;
+std::unique_ptr<SampleProcLoader> procLoader;
+std::unique_ptr<nos::app::AppServiceClient> client;
+
+// Mailbox between the SDK's API thread and the render thread.
+//
+// Every AppEventDelegates callback arrives on the API thread, so none of them touch Vulkan or the
+// sync protocol directly -- they only record what happened. The render loop drains this at the
+// top of each iteration and does the real work on the thread that owns the device.
+//
+// This is deliberately raw rather than NodosCommunicator/IAppNode. The communicator answers a
+// skipped range of N frames with a single ExecutionCompleted, while the engine decrements
+// SyncedState.OutstandingExecuteRequests once per message -- so every skipped range leaks N-1
+// outstanding requests, EarliestUnansweredFrameTime never clears, and hang detection fires. Here
+// the accounting is ours: one ExecutionCompleted per AppExecuteStart, always.
+struct SampleEventDelegates final : nos::app::AppEventDelegates
+{
+	std::mutex Mutex;
+
+	nos::fb::UUID NodeId{};
+	bool NodeImported = false;
+	std::optional<nos::app::ExecutionState> PendingState;
+	// Frame counters the engine has asked us to execute and we have not answered yet.
+	std::deque<uint64_t> PendingExecutes;
+
+	void OnAppConnected() override { std::cout << "Connected to Nodos" << std::endl; }
+
+	void OnConnectionClosed() override
+	{
+		std::lock_guard lock(Mutex);
+		PendingExecutes.clear();
+	}
+
+	void OnNodeImported(nos::fb::Node const& appNode) override
+	{
+		std::cout << "Node imported from Nodos" << std::endl;
+		std::lock_guard lock(Mutex);
+		NodeId = *appNode.id();
+		NodeImported = true;
+	}
+
+	void OnNodeRemoved() override
+	{
+		std::lock_guard lock(Mutex);
+		PendingExecutes.clear();
+		PendingState = nos::app::ExecutionState::IDLE;
+	}
+
+	void OnStateChanged(nos::app::ExecutionState newState) override
+	{
+		std::lock_guard lock(Mutex);
+		PendingState = newState;
+		if (newState != nos::app::ExecutionState::SYNCED)
+			PendingExecutes.clear();
+	}
+
+	void OnExecuteStart(nos::app::AppExecuteStart const* appExecuteStart) override
+	{
+		std::lock_guard lock(Mutex);
+		// The engine sends this with reset on path stop; the queued frames are abandoned and must
+		// not be answered.
+		if (appExecuteStart->reset())
+		{
+			PendingExecutes.clear();
+			return;
+		}
+		PendingExecutes.push_back(appExecuteStart->frame_counter());
+	}
+};
+
+SampleEventDelegates eventDelegates;
+
+// Pin identity and sync state, owned by the render thread.
+nos::uuid ShaderInputPinId;
+nos::uuid ShaderOutputPinId;
+
+// Exported timeline semaphores shared with nos.sys.vulkan, recreated on every entry into SYNCED.
+rc<Semaphore> InputSemaphore;
+rc<Semaphore> OutputSemaphore;
 
 struct SwapchainInfo
 {
@@ -202,19 +265,28 @@ bool CreateSwapchain()
 	swapchainInfo.FrameCount = imageCount;
 	for (auto img : images)
 	{
-	
-		auto vkImg = swapchainInfo.Images.emplace_back(
-				Image::New(GVkDevice.get(),
-						   img,
-						   VkExtent2D{WIDTH, HEIGHT},
-						   VK_FORMAT_B8G8R8A8_UNORM,
-						   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+		// The swapchain owns these images, so they are wrapped rather than allocated: no
+		// Allocation, and the initial state is undefined until the first transition.
+		swapchainInfo.Images.emplace_back(
+				Image::FromExisting(GVkDevice.get(),
+									img,
+									VkExtent3D{WIDTH, HEIGHT, 1},
+									VK_FORMAT_B8G8R8A8_UNORM,
+									VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+									ImageState{.StageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+											   .AccessMask = VK_ACCESS_2_NONE,
+											   .Layout = VK_IMAGE_LAYOUT_UNDEFINED},
+									/*allocation*/ std::nullopt,
+									/*size*/ 0,
+									VK_IMAGE_TYPE_2D));
 	}
 
 	for (int i = 0; i < swapchainInfo.FrameCount; i++)
 	{
-		WaitSemaphores.push_back(Semaphore::New(GVkDevice.get(), VkSemaphoreType::VK_SEMAPHORE_TYPE_BINARY));
-		SignalSemaphores.push_back(Semaphore::New(GVkDevice.get(), VkSemaphoreType::VK_SEMAPHORE_TYPE_BINARY));
+		WaitSemaphores.push_back(
+			Semaphore::New(GVkDevice.get(), VkSemaphoreType::VK_SEMAPHORE_TYPE_BINARY, /*shouldExport*/ false));
+		SignalSemaphores.push_back(
+			Semaphore::New(GVkDevice.get(), VkSemaphoreType::VK_SEMAPHORE_TYPE_BINARY, /*shouldExport*/ false));
 	}
 
 	return err == VK_SUCCESS ? true : false;
@@ -256,54 +328,33 @@ rc<Renderpass> CreatePass()
 int InitNosSDK()
 {
 	// Initialize Nodos SDK
-	nos::app::FN_CheckSDKCompatibility* pfnCheckSDKCompatibility = nullptr;
-	nos::app::FN_MakeAppServiceClient* pfnMakeAppServiceClient = nullptr;
-	nos::app::FN_ShutdownClient* pfnShutdownClient = nullptr;
-
 #if defined(_WIN32)
-	HMODULE sdkModule = LoadLibrary(NODOS_APP_SDK_DLL);
-	if (sdkModule) {
-		pfnCheckSDKCompatibility = (nos::app::FN_CheckSDKCompatibility*)GetProcAddress(sdkModule, "CheckSDKCompatibility");
-		pfnMakeAppServiceClient = (nos::app::FN_MakeAppServiceClient*)GetProcAddress(sdkModule, "MakeAppServiceClient");
-		pfnShutdownClient = (nos::app::FN_ShutdownClient*)GetProcAddress(sdkModule, "ShutdownClient");
-	}
+	SampleProcLoader::ModuleHandle sdkModule = LoadLibrary(NODOS_APP_SDK_DLL);
 #elif defined(__linux__)
-	void* sdkModule = dlopen(NODOS_APP_SDK_DLL, RTLD_LAZY);
-	if (sdkModule) {
-		pfnCheckSDKCompatibility = (nos::app::FN_CheckSDKCompatibility*)dlsym(sdkModule, "CheckSDKCompatibility");
-		pfnMakeAppServiceClient = (nos::app::FN_MakeAppServiceClient*)dlsym(sdkModule, "MakeAppServiceClient");
-		pfnShutdownClient = (nos::app::FN_ShutdownClient*)dlsym(sdkModule, "ShutdownClient");
-	}
+	SampleProcLoader::ModuleHandle sdkModule = dlopen(NODOS_APP_SDK_DLL, RTLD_LAZY);
 #else
 #error "Unsupported platform"
 #endif
-	else {
+	if (!sdkModule) {
 		std::cerr << "Failed to load Nodos SDK" << std::endl;
 		return -1;
 	}
 
-	if (!pfnCheckSDKCompatibility || !pfnMakeAppServiceClient || !pfnShutdownClient) {
-		std::cerr << "Failed to load Nodos SDK functions" << std::endl;
-		return -1;
-	}
+	procLoader = std::make_unique<SampleProcLoader>(sdkModule);
 
-	if (!pfnCheckSDKCompatibility(NOS_APPLICATION_SDK_VERSION_MAJOR, NOS_APPLICATION_SDK_VERSION_MINOR, NOS_APPLICATION_SDK_VERSION_PATCH)) {
-		std::cerr << "Incompatible Nodos SDK version" << std::endl;
-		return -1;
-	}
-
-	client = pfnMakeAppServiceClient("localhost:50053", nos::app::ApplicationInfo{ 
+	nosApplicationInfo appInfo{
 		.AppKey = "Sample-Vulkan-App",
 		.AppName = "Sample Vulkan App"
-	});
+	};
 
-	if (!client) {
-		std::cerr << "Failed to create App Service Client" << std::endl;
+	// CreateClient resolves the SDK entry points and checks version compatibility itself.
+	auto clientResult = nos::app::AppServiceClient::CreateClient(*procLoader, "localhost:50053", appInfo);
+	if (!clientResult) {
+		std::cerr << "Failed to create App Service Client: " << *clientResult.Error() << std::endl;
 		return -1;
 	}
-	// TODO: Shutdown client
-	eventDelegates = new SampleEventDelegates(client);
-	client->RegisterEventDelegates(eventDelegates);
+	client = std::move(*clientResult.Ok());
+	client->SetEventDelegates(eventDelegates);
 
 	while (!client->TryConnect())
 	{
@@ -313,73 +364,269 @@ int InitNosSDK()
 	return 0;
 }
 
+// Describes an image we exported to Nodos. TTexture no longer carries resolution/unmanaged/
+// unscaled/handle: width and height are always literal, `unscaled` moved into the pin's
+// texture_options extension, and the memory offset moved into ExternalMemory.
+nos::sys::vulkan::TTexture MakeTextureDef(rc<Image> const& image)
+{
+	auto const& exportInfo = image->GetExportInfo();
+
+	nos::sys::vulkan::TTexture texture;
+	texture.width = image->GetExtent().width;
+	texture.height = image->GetExtent().height;
+	texture.format = nos::sys::vulkan::Format(image->GetFormat());
+	texture.usage = nos::sys::vulkan::ImageUsage(image->Usage);
+	texture.size_in_bytes = image->Size;
+	auto& ext = texture.external_memory;
+	ext.mutate_handle_type(exportInfo.HandleType);
+	ext.mutate_handle((u64)exportInfo.Handle);
+	ext.mutate_allocation_size((u64)exportInfo.AllocationSize);
+	ext.mutate_pid((u64)exportInfo.PID);
+	ext.mutate_offset((u64)exportInfo.Offset);
+	return texture;
+}
+
+// `unscaled` tells nos.sys.vulkan to take the exported image at its own size instead of
+// rescaling it to the graph resolution. It used to live on the texture value; it is now a pin
+// extension carrying an opaque TexturePinOptions blob, hence the nested builder.
+flatbuffers::Offset<nos::fb::PinExtension> CreateUnscaledTextureOptions(flatbuffers::FlatBufferBuilder& fbb)
+{
+	flatbuffers::FlatBufferBuilder optionsBuilder;
+	optionsBuilder.Finish(nos::sys::vulkan::CreateTexturePinOptions(optionsBuilder, /*unscaled*/ true));
+	const std::vector<uint8_t> optionsData(optionsBuilder.GetBufferPointer(),
+										   optionsBuilder.GetBufferPointer() + optionsBuilder.GetSize());
+	return nos::fb::CreatePinExtensionDirect(fbb, "texture_options",
+											 nos::sys::vulkan::TexturePinOptions::GetFullyQualifiedName(), &optionsData);
+}
+
+// App <-> subsystem resource traffic goes to nos.sys.vulkan as a ResourceShareMessage wrapped in
+// an app CustomMessage. The ResourceShareMessage is a self-contained buffer carried as an opaque
+// payload inside the CustomMessage, so two builders are required.
+void SendResourceShareMessage(nos::sys::vulkan::ResourceShareMessageUnion messageType,
+							  flatbuffers::Offset<void> message,
+							  flatbuffers::FlatBufferBuilder& messageBuilder)
+{
+	messageBuilder.Finish(nos::sys::vulkan::CreateResourceShareMessage(messageBuilder, messageType, message));
+	const std::vector<uint8_t> payload(messageBuilder.GetBufferPointer(),
+									   messageBuilder.GetBufferPointer() + messageBuilder.GetSize());
+
+	flatbuffers::FlatBufferBuilder eventBuilder;
+	eventBuilder.Finish(nos::CreateAppEventOffset(
+		eventBuilder,
+		nos::app::CreateCustomMessageDirect(eventBuilder, "nos.sys.vulkan",
+											nos::sys::vulkan::ResourceShareMessage::GetFullyQualifiedName(), &payload)));
+	nos::Buffer buffer = eventBuilder.Release();
+	client->Send(buffer.As<nos::app::AppEvent>());
+}
+
+// Hands the exported image's memory to nos.sys.vulkan for the given pin. Publishing the texture
+// as a pin value is not enough on its own: without this the subsystem never imports our external
+// memory and the pin stays empty.
+void SendImportResource(nos::uuid const& pinId, nos::sys::vulkan::TTexture const& texture)
+{
+	flatbuffers::FlatBufferBuilder mb;
+	auto packed = nos::sys::vulkan::Texture::Pack(mb, &texture);
+	auto importResource =
+		nos::sys::vulkan::CreateImportResource(mb, &pinId, nos::sys::vulkan::ResourceUnion::Texture, packed.Union());
+	SendResourceShareMessage(nos::sys::vulkan::ResourceShareMessageUnion::ImportResource, importResource.Union(), mb);
+}
+
+nos::uuid GeneratePinId()
+{
+	const std::vector<uint8_t> randomBytes = generateRandomBytes(16);
+	return nos::uuid(std::span<const uint8_t, 16>(randomBytes.data(), 16));
+}
+
 void CreateTexturePinsInNodos()
 {
+	// Stable across re-imports, so CLEAR_PINS + re-add replaces the same two pins instead of
+	// accumulating a new pair every time the node comes back.
+	if (ShaderInputPinId == nos::uuid{})
+	{
+		ShaderInputPinId = GeneratePinId();
+		ShaderOutputPinId = GeneratePinId();
+	}
+
 	std::vector<flatbuffers::Offset<nos::fb::Pin>> pins;
 	flatbuffers::FlatBufferBuilder fbb;
-	{
-		nos::sys::vulkan::TTexture Texture;
-		Texture.resolution = nos::sys::vulkan::SizePreset::CUSTOM;
-		Texture.width = ShaderInput->GetExtent().width;
-		Texture.height = ShaderInput->GetExtent().height;
-		Texture.format = nos::sys::vulkan::Format(ShaderInput->GetFormat());
-		Texture.usage = nos::sys::vulkan::ImageUsage(ShaderInput->Usage);
-		auto& Ext = Texture.external_memory;
-		Ext.mutate_handle_type(ShaderInput->GetExportInfo().HandleType);
-		Ext.mutate_handle((u64)ShaderInput->GetExportInfo().Handle);
-		Ext.mutate_allocation_size((u64)ShaderInput->GetExportInfo().AllocationSize);
-		Ext.mutate_pid((u64)ShaderInput->GetExportInfo().PID);
-		Texture.unmanaged = false;
-		Texture.unscaled = true;
-		Texture.handle = 0;
-		Texture.offset = ShaderInput->GetExportInfo().Offset;
 
-		flatbuffers::FlatBufferBuilder fb;
-		auto offset1 = nos::sys::vulkan::CreateTexture(fb, &Texture);
-		fb.Finish(offset1);
-		nos::Buffer buffer = fb.Release();
-		std::vector<uint8_t>data = buffer;
+	const nos::sys::vulkan::TTexture inputTexture = MakeTextureDef(ShaderInput);
+	const nos::sys::vulkan::TTexture outputTexture = MakeTextureDef(ShaderOutput);
 
-		size_t numBytes = 16;
-		std::vector<uint8_t> randomBytes = generateRandomBytes(numBytes);
+	// CreatePinDirect now takes a vector of visualizers where the category string used to be, an
+	// extensions vector right after the data, and no longer has an advanced_property parameter.
+	auto addTexturePin = [&fbb, &pins](nos::uuid const& id,
+									   const char* name,
+									   const char* displayName,
+									   nos::fb::ShowAs showAs,
+									   nos::fb::CanShowAs canShowAs,
+									   nos::sys::vulkan::TTexture const& texture) {
+		flatbuffers::FlatBufferBuilder valueBuilder;
+		valueBuilder.Finish(nos::sys::vulkan::CreateTexture(valueBuilder, &texture));
+		nos::Buffer buffer = valueBuilder.Release();
+		std::vector<uint8_t> data = buffer;
 
+		std::vector<flatbuffers::Offset<nos::fb::PinExtension>> extensions{CreateUnscaledTextureOptions(fbb)};
 
-		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Input", "nos.sys.vulkan.Texture", nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
-	}
-	{
-		nos::sys::vulkan::TTexture Texture;
-		Texture.resolution = nos::sys::vulkan::SizePreset::CUSTOM;
-		Texture.width = ShaderOutput->GetExtent().width;
-		Texture.height = ShaderOutput->GetExtent().height;
-		Texture.format = nos::sys::vulkan::Format(ShaderOutput->GetFormat());
-		Texture.usage = nos::sys::vulkan::ImageUsage(ShaderOutput->Usage);
-		auto& Ext = Texture.external_memory;
-		Ext.mutate_handle_type(ShaderOutput->GetExportInfo().HandleType);
-		Ext.mutate_handle((u64)ShaderOutput->GetExportInfo().Handle);
-		Ext.mutate_allocation_size((u64)ShaderOutput->GetExportInfo().AllocationSize);
-		Ext.mutate_pid((u64)ShaderOutput->GetExportInfo().PID);
-		Texture.unmanaged = false;
-		Texture.unscaled = true;
-		Texture.handle = 0;
-		Texture.offset = ShaderOutput->GetExportInfo().Offset;
+		pins.push_back(nos::fb::CreatePinDirect(
+			fbb, &id, name, nos::sys::vulkan::Texture::GetFullyQualifiedName(), showAs, canShowAs,
+			/*visualizers*/ nullptr, &data, &extensions,
+			/*referred_by*/ nullptr, /*min*/ nullptr, /*max*/ nullptr, /*def*/ nullptr,
+			/*step*/ 0.0f, /*readonly*/ false, /*transient*/ false, /*meta_data_map*/ nullptr,
+			/*live*/ false, nos::fb::PinContents::JobPin, /*contents*/ 0, /*orphan_state*/ 0,
+			nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", displayName));
+	};
 
-		flatbuffers::FlatBufferBuilder fb;
-		auto offset1 = nos::sys::vulkan::CreateTexture(fb, &Texture);
-		fb.Finish(offset1);
-		nos::Buffer buffer = fb.Release();
-		std::vector<uint8_t>data = buffer;
+	addTexturePin(ShaderInputPinId, "Shader Input", "Texture Input", nos::fb::ShowAs::INPUT_PIN,
+				  nos::fb::CanShowAs::INPUT_PIN_ONLY, inputTexture);
+	addTexturePin(ShaderOutputPinId, "Shader Output", "Texture Output", nos::fb::ShowAs::OUTPUT_PIN,
+				  nos::fb::CanShowAs::OUTPUT_PIN_ONLY, outputTexture);
 
-		size_t numBytes = 16;
-		std::vector<uint8_t> randomBytes = generateRandomBytes(numBytes);
-
-		pins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)randomBytes.data(), "Shader Output", "nos.sys.vulkan.Texture", nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, &data, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
-	}
-
-	auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates->NodeId, nos::ClearFlags::ANY, 0, &pins, 0, 0, 0, 0);
+	auto offset = nos::CreatePartialNodeUpdateDirect(fbb, &eventDelegates.NodeId, nos::ClearFlags::CLEAR_PINS, 0, &pins);
 	fbb.Finish(offset);
-	auto buf = fbb.Release();
-	auto root = flatbuffers::GetRoot<nos::PartialNodeUpdate>(buf.data());
-	client->SendPartialNodeUpdate(*root);
+	nos::Buffer update = fbb.Release();
+	client->SendPartialNodeUpdate(update.As<nos::PartialNodeUpdate>());
+
+	SendImportResource(ShaderInputPinId, inputTexture);
+	SendImportResource(ShaderOutputPinId, outputTexture);
+}
+
+// Until nos.sys.vulkan has both semaphores it reports the node as not sync-ready and the engine
+// logs "Sync not ready, skipping execution" and skips every frame. Receiving this is also what
+// makes the subsystem subscribe to the node's execution.
+void SendSyncSemaphoresToNodos()
+{
+	if (!InputSemaphore || !OutputSemaphore || !InputSemaphore->OsHandle || !OutputSemaphore->OsHandle)
+	{
+		std::cerr << "Sync semaphores are not exportable, Nodos will not execute this node" << std::endl;
+		return;
+	}
+
+	flatbuffers::FlatBufferBuilder mb;
+	auto semaphores = nos::sys::vulkan::CreateSetInputOutputSyncSemaphores(mb,
+																		  (u64)PlatformGetCurrentProcessId(),
+																		  (u64)*InputSemaphore->OsHandle,
+																		  (u64)*OutputSemaphore->OsHandle);
+	SendResourceShareMessage(nos::sys::vulkan::ResourceShareMessageUnion::SetInputOutputSyncSemaphores,
+							 semaphores.Union(), mb);
+}
+
+// AppEventDelegates::OnStateChanged only reports the new state, so the previous one is tracked
+// here to keep the from->to logging.
+nos::app::ExecutionState currentExecutionState = nos::app::ExecutionState::IDLE;
+
+// Runs on the render thread, from the mailbox drain at the top of the loop -- creating Vulkan
+// semaphores on the API thread would race the device this loop owns.
+void ApplyExecutionStateChange(nos::app::ExecutionState newState)
+{
+	std::cout << "Execution state changed from " << nos::app::EnumNameExecutionState(currentExecutionState)
+			  << " to " << nos::app::EnumNameExecutionState(newState) << std::endl;
+	currentExecutionState = newState;
+
+	InputSemaphore.reset();
+	OutputSemaphore.reset();
+
+	if (newState == nos::app::ExecutionState::SYNCED)
+	{
+		InputSemaphore = Semaphore::New(GVkDevice.get(), VK_SEMAPHORE_TYPE_TIMELINE, /*shouldExport*/ true);
+		OutputSemaphore = Semaphore::New(GVkDevice.get(), VK_SEMAPHORE_TYPE_TIMELINE, /*shouldExport*/ true);
+		SendSyncSemaphoresToNodos();
+	}
+}
+
+// Anchors the timelines to wherever the engine's frame counter actually is, before executing
+// frame N.
+//
+// Assuming a fresh semaphore may start at 0 is a deadlock. The engine has two paths back into
+// SYNCED and they differ: ProcessNodeContext::OnHangDetected does `SyncedState = {}` first, so its
+// counter really does restart at 0 -- but ProcessNodeContext::RestartSync just toggles
+// IDLE->SYNCED and leaves the counter running. The app gets the same StateChanged event either way
+// and cannot tell them apart. After a path restart the engine resumes at frame N and its input
+// copies wait for 2N on a semaphore we just created at 0; nothing ever signals that, because we
+// would be waiting on 2N+1, which only the engine produces.
+//
+// Entering frame N the protocol says input should be at 2N (what we signalled at N-1) and output
+// at 2N (what the engine signalled at N-1), so that is what we re-anchor to. Timeline waits are
+// >=, so this also covers frames we skipped: catching up to the newest request satisfies every
+// engine wait for the ones in between. At steady state the values already match and it is a no-op.
+void RebaseTimelines(uint64_t frameNumber)
+{
+	if (!InputSemaphore || !OutputSemaphore)
+		return;
+
+	const uint64_t base = 2 * frameNumber;
+	// vkSignalSemaphore rejects a value that does not advance the timeline, hence the guards.
+	if (InputSemaphore->GetValue() < base)
+		InputSemaphore->Signal(base);
+	if (OutputSemaphore->GetValue() < base)
+		OutputSemaphore->Signal(base);
+}
+
+// Puts this frame's half of the handshake onto the command buffer that reads ShaderInput and
+// writes ShaderOutput. Mirrors nos.sys.vulkan's ExternalResourceSynchronizer, which for frame f
+// runs input copies waiting 2f / signalling 2f+1 and output copies waiting 2f+1 / signalling 2f+2.
+void AddFrameSyncToCmd(rc<CommandBuffer> cmd, uint64_t frameNumber)
+{
+	if (!InputSemaphore || !OutputSemaphore)
+		return;
+
+	const uint64_t f = frameNumber;
+
+	// Wait until the engine's input copies for frame f have landed in ShaderInput (it signals
+	// 2f+1), and until its output copies for the previous frame released ShaderOutput (2f).
+	cmd->WaitGroup[InputSemaphore->Handle] = {2 * f + 1, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+	cmd->WaitGroup[OutputSemaphore->Handle] = {2 * f, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+
+	// Release ShaderInput for the engine's next input copies (they wait 2(f+1) = 2f+2), and hand
+	// this frame's ShaderOutput to its output copies (they wait 2f+1).
+	cmd->SignalGroup[InputSemaphore->Handle] = 2 * f + 2;
+	cmd->SignalGroup[OutputSemaphore->Handle] = 2 * f + 1;
+}
+
+// Exactly one of these per AppExecuteStart received, or the engine's OutstandingExecuteRequests
+// never returns to zero and hang detection eventually fires.
+void SendExecutionCompleted(uint64_t frameNumber)
+{
+	flatbuffers::FlatBufferBuilder fbb;
+	nos::Table<nos::app::AppEvent> event = nos::CreateAppEvent(
+		fbb, nos::app::CreateExecutionCompleted(fbb, &eventDelegates.NodeId, frameNumber));
+	client->Send(event.As<nos::app::AppEvent>());
+}
+
+// Drains the API-thread mailbox and returns the frame to execute this iteration, if any.
+std::optional<uint64_t> ServiceNodosEvents()
+{
+	bool importPins = false;
+	std::optional<nos::app::ExecutionState> stateChange;
+	std::deque<uint64_t> executes;
+	{
+		std::lock_guard lock(eventDelegates.Mutex);
+		std::swap(importPins, eventDelegates.NodeImported);
+		stateChange = std::exchange(eventDelegates.PendingState, std::nullopt);
+		std::swap(executes, eventDelegates.PendingExecutes);
+	}
+
+	if (stateChange)
+		ApplyExecutionStateChange(*stateChange);
+	if (importPins)
+		CreateTexturePinsInNodos();
+
+	if (executes.empty())
+		return std::nullopt;
+
+	// Render only the newest request. RebaseTimelines below moves both timelines past everything
+	// the skipped frames' copies are waiting on, but each one still needs its own completion.
+	const uint64_t newest = executes.back();
+	RebaseTimelines(newest);
+	for (size_t i = 0; i + 1 < executes.size(); ++i)
+	{
+		std::cout << "Execute skipped for frame " << executes[i] << " (behind by " << (executes.size() - 1 - i)
+				  << ")" << std::endl;
+		SendExecutionCompleted(executes[i]);
+	}
+
+	std::cout << "Execute requested for frame " << newest << std::endl;
+	return newest;
 }
 
 int main() 
@@ -398,16 +645,18 @@ int main()
 	if (context->Devices.empty())
 		return 0;
 	GVkDevice = context->Devices[0];
-	pool = GVkDevice->GetPool();
-	
+	pool = GVkDevice->GetCommandPool();
+
 	auto RP = CreatePass();
 
 	InitWindow();
 	CreateSurface();
 	CreateSwapchain();
 
-	ImageCreateInfo createInfo = {
-		.Extent = {1920, 1080},
+	// The default ResourceCreateRequest already asks for the platform's external memory handle
+	// type, which is what makes these images shareable with Nodos.
+	ImageCreateRequest createInfo = {
+		.Extent = {1920, 1080, 1},
 		.Format = VK_FORMAT_R8G8B8A8_UNORM,
 		.Usage = VK_IMAGE_USAGE_SAMPLED_BIT |
 				  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -416,20 +665,21 @@ int main()
 				  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 	};
 
-	VkResult re;
-	ShaderInput = Image::New(GVkDevice.get(), createInfo, &re);
-	if (re != VK_SUCCESS)
+	auto shaderInputResult = Image::Create(GVkDevice.get(), createInfo);
+	if (!shaderInputResult)
 	{
-		std::cout << "Failed to create input image" << std::endl;
+		std::cout << "Failed to create input image: " << *shaderInputResult.Error() << std::endl;
 		return 0;
 	}
-	ShaderOutput = Image::New(GVkDevice.get(), createInfo, &re);
-	if (re != VK_SUCCESS)
-	{
-		std::cout << "Failed to create output image" << std::endl;
+	ShaderInput = *shaderInputResult.Ok();
 
+	auto shaderOutputResult = Image::Create(GVkDevice.get(), createInfo);
+	if (!shaderOutputResult)
+	{
+		std::cout << "Failed to create output image: " << *shaderOutputResult.Error() << std::endl;
 		return 0;
 	}
+	ShaderOutput = *shaderOutputResult.Ok();
 
 	InitNosSDK();
 	
@@ -445,25 +695,35 @@ int main()
 			}
 		}
 
-		uint32_t imageIndex; 
+		// Non-blocking: applies whatever the API thread recorded and tells us whether Nodos is
+		// waiting on a frame. The window keeps rendering at its own rate either way, so the loop
+		// never parks waiting for the engine.
+		const std::optional<uint64_t> executeFrame = ServiceNodosEvents();
+
+		uint32_t imageIndex;
 		GVkDevice->AcquireNextImageKHR(swapchain, 10000, WaitSemaphores[frame]->Handle, 0, &imageIndex);
 		auto cmd = pool->BeginCmd();
 
 		RP->BindResource("Input", ShaderInput, VkFilter::VK_FILTER_NEAREST);
 		RP->TransitionInput(cmd, "Input", ShaderInput);
 
+		// A pass can now render to several attachments, so OutImage became the OutImages vector,
+		// and DeltaSeconds is gone.
 		Renderpass::ExecPassInfo info{
-		  .BeginInfo = {.OutImage = ShaderOutput,
+		  .BeginInfo = {.OutImages = {ShaderOutput},
 		  			  .DepthAttachment = std::nullopt,
 		  			  .Wireframe = false,
 		  			  .Clear = true,
 		  			  .FrameNumber = 0,
-		  			  .DeltaSeconds = 0.f,
 		  			  .ClearCol = {0.0f,0.0f,0.0f,1.0f}},
-					  .VtxData = 0};
+					  .VtxData = std::nullopt};
 
-		RP->Exec(cmd, info);
-		
+		if (auto err = RP->Exec(cmd, info))
+		{
+			std::cerr << "Failed to execute pass: " << *err << std::endl;
+			break;
+		}
+
 		//copy from texture to swapchain image
 		swapchainInfo.Images[imageIndex]->CopyFrom(cmd, ShaderOutput);
 
@@ -475,8 +735,27 @@ int main()
 		cmd->WaitGroup[WaitSemaphores[frame]->Handle] = {1, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
 		cmd->SignalGroup[SignalSemaphores[frame]->Handle] = 1;
 
-		cmd->Submit();
-		cmd->Wait();
+		// This one submit both consumes ShaderInput and produces ShaderOutput, so it carries both
+		// halves of the handshake with the engine.
+		if (executeFrame)
+			AddFrameSyncToCmd(cmd, *executeFrame);
+
+		VkResult submitResult = VK_SUCCESS;
+		cmd->Submit(&submitResult);
+		if (submitResult != VK_SUCCESS)
+		{
+			std::cerr << "Failed to submit command buffer: " << vk_result_string(submitResult) << std::endl;
+			break;
+		}
+		// Bounded (nosVulkan waits 3s by default) and deliberately checked. This submit waits on
+		// semaphores the engine drives, so a desync shows up here as a timeout. Presenting anyway
+		// would read an image whose writes are still pending, so bail instead of corrupting.
+		if (!cmd->Wait())
+		{
+			std::cerr << "Timed out waiting for frame " << executeFrame.value_or(0)
+					  << "; Nodos sync is not advancing" << std::endl;
+			break;
+		}
 
 		VkPresentInfoKHR pi{};
 		pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -488,6 +767,9 @@ int main()
 		VkResult res;
 		pi.pResults = &res;
 		NOSVK_ASSERT(GVkDevice->MainQueue->PresentKHR(&pi));
+
+		if (executeFrame)
+			SendExecutionCompleted(*executeFrame);
 
 		frame = (frame + 1) % swapchainInfo.FrameCount;
     }
