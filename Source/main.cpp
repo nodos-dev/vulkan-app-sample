@@ -177,6 +177,10 @@ nos::uuid ShaderOutputPinId;
 rc<Semaphore> InputSemaphore;
 rc<Semaphore> OutputSemaphore;
 
+// Last frame whose submit carried the handshake. Needed to free that submit if it ends up parked
+// on a value the engine stopped producing.
+std::optional<uint64_t> LastSubmittedFrame;
+
 struct SwapchainInfo
 {
 	VkSwapchainKHR Handle = 0;
@@ -515,6 +519,9 @@ void SendSyncSemaphoresToNodos()
 // here to keep the from->to logging.
 nos::app::ExecutionState currentExecutionState = nos::app::ExecutionState::IDLE;
 
+void SignalIfBelow(rc<Semaphore> const& semaphore, uint64_t value);
+void ReleaseParkedSubmit(uint64_t frameNumber);
+
 // Runs on the render thread, from the mailbox drain at the top of the loop -- creating Vulkan
 // semaphores on the API thread would race the device this loop owns.
 void ApplyExecutionStateChange(nos::app::ExecutionState newState)
@@ -523,8 +530,24 @@ void ApplyExecutionStateChange(nos::app::ExecutionState newState)
 			  << " to " << nos::app::EnumNameExecutionState(newState) << std::endl;
 	currentExecutionState = newState;
 
+	// Release, then drain, then slam -- in that order. A submit of ours can be parked on a value
+	// the engine will never produce now, and destroying a semaphore with operations still pending
+	// on it is invalid, as is waiting for a device that can never go idle.
+	if (InputSemaphore && OutputSemaphore)
+	{
+		if (LastSubmittedFrame)
+			ReleaseParkedSubmit(*LastSubmittedFrame);
+		// Now nothing of ours can be stuck, so this completes and leaves nothing queued.
+		GVkDevice->DeviceWaitIdle();
+		// Safe only once our queue is empty: with no queued signals left there is nothing to land
+		// below it. Frees anything the engine still has parked further ahead than we reached.
+		SignalIfBelow(InputSemaphore, UINT64_MAX);
+		SignalIfBelow(OutputSemaphore, UINT64_MAX);
+	}
+
 	InputSemaphore.reset();
 	OutputSemaphore.reset();
+	LastSubmittedFrame.reset();
 
 	if (newState == nos::app::ExecutionState::SYNCED)
 	{
@@ -549,17 +572,34 @@ void ApplyExecutionStateChange(nos::app::ExecutionState newState)
 // at 2N (what the engine signalled at N-1), so that is what we re-anchor to. Timeline waits are
 // >=, so this also covers frames we skipped: catching up to the newest request satisfies every
 // engine wait for the ones in between. At steady state the values already match and it is a no-op.
+// vkSignalSemaphore rejects a value that does not advance the timeline, hence the guard.
+void SignalIfBelow(rc<Semaphore> const& semaphore, uint64_t value)
+{
+	if (semaphore && semaphore->GetValue() < value)
+		semaphore->Signal(value);
+}
+
 void RebaseTimelines(uint64_t frameNumber)
 {
 	if (!InputSemaphore || !OutputSemaphore)
 		return;
 
 	const uint64_t base = 2 * frameNumber;
-	// vkSignalSemaphore rejects a value that does not advance the timeline, hence the guards.
-	if (InputSemaphore->GetValue() < base)
-		InputSemaphore->Signal(base);
-	if (OutputSemaphore->GetValue() < base)
-		OutputSemaphore->Signal(base);
+	SignalIfBelow(InputSemaphore, base);
+	SignalIfBelow(OutputSemaphore, base);
+}
+
+// Frees our own submit when it is parked on a value the engine has stopped producing.
+//
+// The submit waits on input 2f+1 and output 2f, and goes on to signal 2f+2 and 2f+1. Signalling
+// exactly the values it waits on releases it while staying strictly below what it signals, so
+// nothing ever decreases -- which a Vulkan timeline forbids outright. (Slamming UINT64_MAX would
+// release it too, but then its own queued signals land below that and are illegal. D3D12 tolerates
+// that, which is why the Unreal plugin can slam; we cannot.)
+void ReleaseParkedSubmit(uint64_t frameNumber)
+{
+	SignalIfBelow(InputSemaphore, 2 * frameNumber + 1);
+	SignalIfBelow(OutputSemaphore, 2 * frameNumber);
 }
 
 // Puts this frame's half of the handshake onto the command buffer that reads ShaderInput and
@@ -598,12 +638,26 @@ std::optional<uint64_t> ServiceNodosEvents()
 {
 	bool importPins = false;
 	std::optional<nos::app::ExecutionState> stateChange;
-	std::deque<uint64_t> executes;
+	std::optional<uint64_t> executeFrame;
+	size_t queueDepth = 0;
 	{
 		std::lock_guard lock(eventDelegates.Mutex);
 		std::swap(importPins, eventDelegates.NodeImported);
 		stateChange = std::exchange(eventDelegates.PendingState, std::nullopt);
-		std::swap(executes, eventDelegates.PendingExecutes);
+		queueDepth = eventDelegates.PendingExecutes.size();
+		// Oldest first, one per iteration. Skipping to the newest and host-advancing past the rest
+		// looks like a latency win and is corruption: a frame the engine RAN is not a frame the
+		// engine skipped. For each one it has already queued copies -- input waits 2f / signals
+		// 2f+1, output waits 2f+1 / signals 2f+2. Pushing the timeline past them releases those
+		// copies to signal below where we just moved it, which is an illegal decrease.
+		//
+		// Falling behind is self-limiting: the engine's copies are parked on values only we
+		// produce, so its path stalls and it stops issuing requests until we catch up.
+		if (!eventDelegates.PendingExecutes.empty())
+		{
+			executeFrame = eventDelegates.PendingExecutes.front();
+			eventDelegates.PendingExecutes.pop_front();
+		}
 	}
 
 	if (stateChange)
@@ -611,22 +665,15 @@ std::optional<uint64_t> ServiceNodosEvents()
 	if (importPins)
 		CreateTexturePinsInNodos();
 
-	if (executes.empty())
+	if (!executeFrame)
 		return std::nullopt;
 
-	// Render only the newest request. RebaseTimelines below moves both timelines past everything
-	// the skipped frames' copies are waiting on, but each one still needs its own completion.
-	const uint64_t newest = executes.back();
-	RebaseTimelines(newest);
-	for (size_t i = 0; i + 1 < executes.size(); ++i)
-	{
-		std::cout << "Execute skipped for frame " << executes[i] << " (behind by " << (executes.size() - 1 - i)
-				  << ")" << std::endl;
-		SendExecutionCompleted(executes[i]);
-	}
+	// Anchors a fresh session's timelines to the engine's counter, and heals them if they fall
+	// behind mid-session. A no-op in steady state.
+	RebaseTimelines(*executeFrame);
 
-	std::cout << "Execute requested for frame " << newest << std::endl;
-	return newest;
+	std::cout << "Execute requested for frame " << *executeFrame << " (queued: " << queueDepth << ")" << std::endl;
+	return executeFrame;
 }
 
 int main() 
@@ -738,7 +785,10 @@ int main()
 		// This one submit both consumes ShaderInput and produces ShaderOutput, so it carries both
 		// halves of the handshake with the engine.
 		if (executeFrame)
+		{
 			AddFrameSyncToCmd(cmd, *executeFrame);
+			LastSubmittedFrame = *executeFrame;
+		}
 
 		VkResult submitResult = VK_SUCCESS;
 		cmd->Submit(&submitResult);
@@ -747,14 +797,30 @@ int main()
 			std::cerr << "Failed to submit command buffer: " << vk_result_string(submitResult) << std::endl;
 			break;
 		}
-		// Bounded (nosVulkan waits 3s by default) and deliberately checked. This submit waits on
-		// semaphores the engine drives, so a desync shows up here as a timeout. Presenting anyway
-		// would read an image whose writes are still pending, so bail instead of corrupting.
+
+		// This submit waits on values the engine drives, and it is the same submit that drives the
+		// swapchain -- so a timeout here is the window freezing, not just a late frame. It happens
+		// in ordinary use: disconnecting the input pin leaves the node SYNCED while nos.sys.vulkan
+		// stops producing 2f+1 entirely, because ProcessInputCopies builds that copy from the pin.
+		//
+		// Waiting it out is what made the app hang until the engine's recovery force-signalled.
+		// Instead, free our own submit at the values it is parked on and carry on. This is the same
+		// self-heal the per-frame rebase provides, applied now rather than next iteration -- the
+		// loop cannot reach the next iteration while it is blocked here.
 		if (!cmd->Wait())
 		{
-			std::cerr << "Timed out waiting for frame " << executeFrame.value_or(0)
-					  << "; Nodos sync is not advancing" << std::endl;
-			break;
+			if (executeFrame)
+			{
+				std::cerr << "Nodos stopped driving frame " << *executeFrame << "; releasing our submit"
+						  << std::endl;
+				ReleaseParkedSubmit(*executeFrame);
+			}
+			if (!cmd->Wait())
+			{
+				std::cerr << "Frame " << executeFrame.value_or(0) << " is stuck on something other than "
+						  << "Nodos sync" << std::endl;
+				break;
+			}
 		}
 
 		VkPresentInfoKHR pi{};
